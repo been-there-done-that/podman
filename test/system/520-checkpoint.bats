@@ -111,6 +111,59 @@ function setup() {
     run_podman rm -t 0 -f $cid
 }
 
+# bats test_tags=ci:parallel
+@test "podman checkpoint/restore with user namespace" {
+    # https://github.com/podman-container-tools/podman/issues/18502
+    if [[ "$(basename $PODMAN_RUNTIME)" != "runc" ]]; then
+        skip "checkpoint with a user namespace only works with runc"
+    fi
+
+    local netname="net-$(safename)"
+    local subnet="$(random_rfc1918_subnet)"
+    run_podman network create --subnet "$subnet.0/24" $netname
+
+    local cname="c-$(safename)"
+    local base=$((300000 + RANDOM * 10))
+    run_podman run -d --name $cname --network $netname \
+               --uidmap 0:$base:5000 --gidmap 0:$base:5000 $IMAGE top
+    run_podman inspect --format '{{.Id}}' $cname
+    local cid="$output"
+
+    run_podman exec $cid cat /proc/self/uid_map
+    local uid_map="$output"
+    run_podman inspect $cid --format "{{(index .NetworkSettings.Networks \"$netname\").IPAddress}}"
+    local ip="$output"
+    assert "$ip" =~ "^$subnet\." "container has an address on $netname"
+
+    # Checkpoint and restore in place
+    run_podman container checkpoint $cid
+    is "$output" "$cid" "podman container checkpoint"
+    run_podman container restore $cid
+    is "$output" "$cid" "podman container restore"
+
+    run_podman container inspect --format '{{.State.Status}}' $cid
+    is "$output" "running" "container is running after restore"
+    run_podman exec $cid cat /proc/self/uid_map
+    is "$output" "$uid_map" "uid map is unchanged after restore"
+    run_podman exec $cid ip -4 addr show eth0
+    assert "$output" =~ "inet $ip/" "network is set up after restore"
+
+    # Checkpoint to an archive, remove the container and restore from it
+    local archive=$PODMAN_TMPDIR/$cname.tar.gz
+    run_podman container checkpoint --export $archive $cid
+    run_podman rm -t 0 -f $cid
+    run_podman container restore --import $archive
+    run_podman container inspect --format '{{.State.Status}}' $cname
+    is "$output" "running" "container is running after restore --import"
+    run_podman exec $cname cat /proc/self/uid_map
+    is "$output" "$uid_map" "uid map is unchanged after restore --import"
+    run_podman exec $cname ip -4 addr show eth0
+    assert "$output" =~ "inet $ip/" "network is set up after restore --import"
+
+    run_podman rm -t 0 -f $cname
+    run_podman network rm $netname
+}
+
 # CANNOT BE PARALLELIZED: checkpoint -a
 @test "podman checkpoint/restore print IDs or raw input" {
     # checkpoint/restore -a must print the IDs
